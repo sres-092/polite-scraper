@@ -1,20 +1,45 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import json
+import re
 import requests
 import time
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 USER_AGENT = "FlyRankInternship-A9/1.0 (+https://github.com/sres-092/polite-scraper)"
 TIMEOUT = 10
 DELAY_SECONDS = 0.5
 MAX_PAGES = 3
 CACHE_DIR = Path("cache")
+OUTPUT_DIR = Path("output")
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
+RATING_WORDS = {"One": 1, "Two": 2, "Three": 3, "Four": 4, "Five": 5}
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT})
+
+
+class Book(BaseModel):
+    title: str = Field(min_length=1)
+    product_url: str
+    price_text: str
+    price_gbp: float = Field(gt=0)
+    availability_text: str
+    available_count: int | None
+    rating_text: str
+    rating: int = Field(ge=1, le=5)
+    description: str | None
+    source_page: str
+    fetched_at: str
+
+    @field_validator("product_url", "source_page")
+    @classmethod
+    def must_be_https(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("URL must start with https://")
+        return value
 
 
 def fetch(url: str, cache_name: str) -> str:
@@ -96,11 +121,46 @@ def extract_book(url: str, source_page: str) -> dict:
     }
 
 
+def normalize(raw: dict) -> dict:
+    record = dict(raw)
+
+    price_match = re.search(r"\d+(\.\d+)?", raw.get("price_text") or "")
+    record["price_gbp"] = float(price_match.group()) if price_match else None
+
+    count_match = re.search(r"\((\d+) available\)", raw.get("availability_text") or "")
+    record["available_count"] = int(count_match.group(1)) if count_match else None
+
+    record["rating"] = RATING_WORDS.get(raw.get("rating_text"))
+    return record
+
+
+def validate_and_store(raw_records: list[dict]) -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    valid = {}
+    errors = []
+
+    for raw in raw_records:
+        record = normalize(raw)
+        try:
+            book = Book(**record)
+        except ValidationError as error:
+            errors.append({"product_url": raw.get("product_url"), "reason": str(error)})
+            continue
+        valid[book.product_url] = book.model_dump()
+
+    with open(OUTPUT_DIR / "books.json", "w", encoding="utf-8") as f:
+        json.dump(list(valid.values()), f, indent=2, ensure_ascii=False)
+    with open(OUTPUT_DIR / "errors.json", "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2, ensure_ascii=False)
+
+    print(f"valid_records={len(valid)}, invalid_records={len(errors)}")
+
+
 def main():
     book_urls = discover_book_urls()
-    records = [extract_book(url, source) for url, source in book_urls.items()]
-    print(json.dumps(records[0], indent=2, ensure_ascii=False))
-    print(f"detail_pages={len(records)}")
+    raw_records = [extract_book(url, source) for url, source in book_urls.items()]
+    print(f"detail_pages={len(raw_records)}")
+    validate_and_store(raw_records)
 
 
 if __name__ == "__main__":
